@@ -1,0 +1,10 @@
+streamlit
+pinecone
+pinecone-text
+groq
+pypdf
+duckduckgo-search
+python-dotenv
+nltk
+cryptography==38.0.4
+sentence-transformers
