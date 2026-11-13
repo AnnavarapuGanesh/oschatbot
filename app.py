@@ -9,11 +9,23 @@ from sentence_transformers import SentenceTransformer
 from groq import Groq
 
 # Load environment variables
+# Load environment variables
 load_dotenv()
 
-GROQ_API_KEY = os.getenv("GROQ_API_KEY")
-PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "os-rag-chatbot")
+def get_config(key, default=None):
+    value = os.getenv(key)
+    if value:
+        return value
+    try:
+        return st.secrets.get(key, default)
+    except Exception:
+        return default
+
+GROQ_API_KEY = get_config("GROQ_API_KEY")
+PINECONE_API_KEY = get_config("PINECONE_API_KEY")
+PINECONE_INDEX_NAME = get_config(
+    "PINECONE_INDEX_NAME", "os-rag-chatbot"
+)
 
 # Initialize Groq
 LLM_MODEL = "llama-3.3-70b-versatile"
