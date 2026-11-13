@@ -354,7 +354,7 @@ if query := st.chat_input("Ask anything about Operating Systems..."):
             )[0].tolist()
 
             # Sparse BM25 query
-            sparse = bm25.encode_queries(query)
+            sparse = bm25.encode_queries([query])[0]
 
             # Hybrid scoring
             hybrid_dense, hybrid_sparse = hybrid_score(
