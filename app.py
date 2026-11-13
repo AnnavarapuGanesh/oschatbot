@@ -52,7 +52,7 @@ PINECONE_INDEX_NAME = get_config(
     "os-rag-chatbot"
 )
 
-LLM_MODEL = "llama-3.3-70b-versatile"
+LLM_MODEL = "openai/gpt-oss-120b"
 
 # Check API keys before initializing resources
 if not GROQ_API_KEY or not PINECONE_API_KEY:
