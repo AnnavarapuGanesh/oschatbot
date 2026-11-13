@@ -1,177 +1,411 @@
+
 import os
 import re
 import time
-import uuid
-from pypdf import PdfReader
+import hashlib
+from pathlib import Path
+
 from dotenv import load_dotenv
+from pypdf import PdfReader
 from sentence_transformers import SentenceTransformer
 from pinecone import Pinecone, ServerlessSpec
 from pinecone_text.sparse import BM25Encoder
 
-# Load environment variables
-load_dotenv()
+# ==========================================
+# 1. CONFIGURATION
+# ==========================================
 
-GEMINI_API_KEY = os.getenv("GEMINI_API_KEY")
+BASE_DIR = Path(__file__).resolve().parent
+load_dotenv(BASE_DIR / ".env")
+
 PINECONE_API_KEY = os.getenv("PINECONE_API_KEY")
-PINECONE_INDEX_NAME = os.getenv("PINECONE_INDEX_NAME", "os-rag-chatbot")
+PINECONE_INDEX_NAME = os.getenv(
+    "PINECONE_INDEX_NAME", "os-rag-chatbot"
+)
 
-# --- Configuration ---
-CHUNK_SIZE_CHARS = 1600  # approx 400 tokens
-OVERLAP_CHARS = 600      # approx 150 tokens
+EMBEDDING_MODEL_NAME = "all-MiniLM-L6-v2"
 EMBEDDING_DIMENSION = 384
+
+CHUNK_SIZE_CHARS = 1600
+OVERLAP_CHARS = 600
+BATCH_SIZE = 32
+
+PDF_FILE = BASE_DIR / "Abraham-Silberschatz-Operating-System-Concepts-10th-2018.pdf"
+TXT_FILE = BASE_DIR / "os_clean_data.txt"
+BM25_FILE = BASE_DIR / "bm25_params.json"
+
 TARGET_TOPICS = [
-    "process management", "memory management", 
-    "deadlock", "scheduling", "file system"
+    "process management",
+    "memory management",
+    "deadlock",
+    "scheduling",
+    "file system"
 ]
 
+
+# ==========================================
+# 2. TEXT CLEANING
+# ==========================================
+
 def clean_text(text):
-    # Remove HTML, repeated nav, and unwanted formatting
-    text = re.sub(r'\[.*?\]\(.*?\)', '', text)  # remove markdown links
+
+    text = re.sub(r'\[.*?\]\(.*?\)', '', text)
     text = re.sub(r'Recaptcha requires verification.', '', text)
     text = re.sub(r'protected by \*\*reCAPTCHA\*\*', '', text)
+
     text = re.sub(r'\n+', '\n', text)
-    text = re.sub(r' +', ' ', text)
-    # Remove short useless lines
-    lines = [line.strip() for line in text.split('\n') if len(line.strip()) > 20 or line.strip().endswith(':')]
+    text = re.sub(r'[ \t]+', ' ', text)
+
+    lines = [
+        line.strip()
+        for line in text.splitlines()
+        if len(line.strip()) > 20
+        or line.strip().endswith(':')
+    ]
+
     return '\n'.join(lines)
 
-def get_chunks(text, chunk_size, overlap):
+
+# ==========================================
+# 3. CHUNKING
+# ==========================================
+
+def get_chunks(text):
+
     chunks = []
-    start = 0
-    while start < len(text):
-        end = start + chunk_size
-        chunk = text[start:end]
-        chunks.append(chunk)
-        start += chunk_size - overlap
+
+    step = CHUNK_SIZE_CHARS - OVERLAP_CHARS
+
+    if step <= 0:
+        raise ValueError("Overlap must be smaller than chunk size.")
+
+    for start in range(0, len(text), step):
+
+        chunk = text[start:start + CHUNK_SIZE_CHARS].strip()
+
+        if chunk:
+            chunks.append(chunk)
+
     return chunks
 
-def extract_pdf_chapters(pdf_path):
-    print("Extracting relevant chapters from PDF...")
-    try:
-        reader = PdfReader(pdf_path)
-        extracted_text = ""
-        # Process only pages that contain target topics to avoid ingesting everything
-        for i, page in enumerate(reader.pages):
-            text = page.extract_text()
-            if text:
-                text_lower = text.lower()
-                if any(topic in text_lower for topic in TARGET_TOPICS):
-                    extracted_text += text + "\n"
-        print(f"Extracted {len(extracted_text)} characters from relevant PDF pages.")
-        return extracted_text
-    except Exception as e:
-        print(f"Error reading PDF: {e}")
+
+# ==========================================
+# 4. EXTRACT TXT
+# ==========================================
+
+def extract_txt():
+
+    print("Extracting TXT data...")
+
+    if not TXT_FILE.exists():
+        print(f"Missing file: {TXT_FILE}")
         return ""
 
-def extract_txt(txt_path):
-    print("Extracting text from local file...")
     try:
-        with open(txt_path, 'r', encoding='utf-8') as f:
-            text = f.read()
-        print(f"Extracted {len(text)} characters from text file.")
+        with open(TXT_FILE, "r", encoding="utf-8") as file:
+            text = file.read()
+
+        print(f"TXT characters: {len(text)}")
         return text
+
     except Exception as e:
-        print(f"Error reading TXT: {e}")
+        print(f"TXT extraction error: {e}")
         return ""
 
-def main():
-    if not GEMINI_API_KEY or not PINECONE_API_KEY:
-        print("Error: Missing API keys in .env")
-        return
-        
-    print("Step 1: Data Preprocessing...")
-    txt_content = extract_txt("os_clean_data.txt")
-    pdf_content = extract_pdf_chapters("Abraham-Silberschatz-Operating-System-Concepts-10th-2018.pdf")
-    
-    txt_clean = clean_text(txt_content)
-    pdf_clean = clean_text(pdf_content)
-    
-    txt_chunks = get_chunks(txt_clean, CHUNK_SIZE_CHARS, OVERLAP_CHARS)
-    pdf_chunks = get_chunks(pdf_clean, CHUNK_SIZE_CHARS, OVERLAP_CHARS)
-    
-    all_chunks = []
+
+# ==========================================
+# 5. EXTRACT PDF
+# ==========================================
+
+def extract_pdf():
+
+    print("Extracting PDF data...")
+
+    if not PDF_FILE.exists():
+        print(f"Missing file: {PDF_FILE}")
+        return ""
+
+    try:
+
+        reader = PdfReader(str(PDF_FILE))
+
+        extracted_text = ""
+
+        for page_number, page in enumerate(reader.pages):
+
+            text = page.extract_text()
+
+            if not text:
+                continue
+
+            text_lower = text.lower()
+
+            if any(topic in text_lower for topic in TARGET_TOPICS):
+
+                extracted_text += (
+                    f"\n[PDF Page {page_number + 1}]\n{text}\n"
+                )
+
+        print(f"PDF characters: {len(extracted_text)}")
+
+        return extracted_text
+
+    except Exception as e:
+
+        print(f"PDF extraction error: {e}")
+        return ""
+
+
+# ==========================================
+# 6. CREATE CHUNKS
+# ==========================================
+
+def prepare_documents():
+
+    print("\nStep 1: Data preprocessing")
+
+    txt_content = clean_text(extract_txt())
+    pdf_content = clean_text(extract_pdf())
+
+    txt_chunks = get_chunks(txt_content)
+    pdf_chunks = get_chunks(pdf_content)
+
+    documents = []
+
     for chunk in txt_chunks:
-        all_chunks.append({"text": chunk, "source": "scraped"})
+        documents.append({
+            "text": chunk,
+            "source": "scraped"
+        })
+
     for chunk in pdf_chunks:
-        all_chunks.append({"text": chunk, "source": "book"})
-        
-    print(f"Total chunks created: {len(all_chunks)}")
-    
-    # Step 2: Prepare Vector DB
-    print("Step 2: Initialize Pinecone...")
+        documents.append({
+            "text": chunk,
+            "source": "book"
+        })
+
+    print(f"TXT chunks: {len(txt_chunks)}")
+    print(f"PDF chunks: {len(pdf_chunks)}")
+    print(f"Total chunks: {len(documents)}")
+
+    return documents
+
+
+# ==========================================
+# 7. INITIALIZE PINECONE
+# ==========================================
+
+def initialize_pinecone():
+
+    print("\nStep 2: Initializing Pinecone")
+
     pc = Pinecone(api_key=PINECONE_API_KEY)
-    
-    # Check if index exists and delete it (dimension mismatch)
-    existing_indexes = [idx.name for idx in pc.list_indexes()]
-    if PINECONE_INDEX_NAME in existing_indexes:
-        print(f"Deleting existing Pinecone index '{PINECONE_INDEX_NAME}' due to dimension change...")
-        pc.delete_index(PINECONE_INDEX_NAME)
-        time.sleep(5)
-        
-    print(f"Creating Pinecone index '{PINECONE_INDEX_NAME}' with dimension {EMBEDDING_DIMENSION}...")
-    pc.create_index(
-        name=PINECONE_INDEX_NAME,
-        dimension=EMBEDDING_DIMENSION, 
-        metric="dotproduct", # Recommended for hybrid search sparse/dense scaling
-        spec=ServerlessSpec(
-            cloud="aws",
-            region="us-east-1"
+
+    existing_indexes = [
+        item.name for item in pc.list_indexes()
+    ]
+
+    if PINECONE_INDEX_NAME not in existing_indexes:
+
+        print("Creating new Pinecone index...")
+
+        pc.create_index(
+            name=PINECONE_INDEX_NAME,
+            dimension=EMBEDDING_DIMENSION,
+            metric="dotproduct",
+            spec=ServerlessSpec(
+                cloud="aws",
+                region="us-east-1"
+            )
         )
-    )
-    print("Waiting for index to be ready...")
-    time.sleep(10) # wait for index to be ready
-        
+
+    else:
+
+        print("Existing Pinecone index found.")
+
+        description = pc.describe_index(PINECONE_INDEX_NAME)
+
+        if description.dimension != EMBEDDING_DIMENSION:
+            raise ValueError(
+                "Pinecone dimension mismatch. "
+                f"Expected {EMBEDDING_DIMENSION}, "
+                f"found {description.dimension}. "
+                "Create a separate correctly configured index."
+            )
+
+    # Wait until index is ready
+    for attempt in range(60):
+
+        description = pc.describe_index(PINECONE_INDEX_NAME)
+
+        if description.status["ready"]:
+            break
+
+        time.sleep(2)
+
+    else:
+        raise TimeoutError("Pinecone index did not become ready.")
+
     index = pc.Index(PINECONE_INDEX_NAME)
-    
-    # Fit BM25 Encoder
-    print("Fitting BM25 Encoder...")
+
+    print("Pinecone connected successfully.")
+
+    return index
+
+
+# ==========================================
+# 8. BM25 ENCODER
+# ==========================================
+
+def initialize_bm25(documents):
+
+    print("\nStep 3: Fitting BM25")
+
+    corpus = [
+        item["text"] for item in documents
+    ]
+
     bm25 = BM25Encoder()
-    corpus = [chunk["text"] for chunk in all_chunks]
-    
-    # Avoid fitting error if corpus is empty
-    if not corpus:
-        print("No valid text found to ingest. Exiting.")
-        return
-        
     bm25.fit(corpus)
-    # Save bm25 values if needed for app.py
-    bm25.dump('bm25_params.json')
-    
-    print("Step 3 & 4: Embeddings and Upsert...")
-    print("Loading Hugging Face model: all-MiniLM-L6-v2")
-    embedding_model = SentenceTransformer("all-MiniLM-L6-v2")
-    
-    batch_size = 32
-    for i in range(0, len(all_chunks), batch_size):
-        batch = all_chunks[i:i+batch_size]
-        texts = [item["text"] for item in batch]
-        
+
+    bm25.dump(str(BM25_FILE))
+
+    print(f"BM25 saved: {BM25_FILE}")
+
+    return bm25
+
+
+# ==========================================
+# 9. LOAD EMBEDDING MODEL
+# ==========================================
+
+def initialize_embedding_model():
+
+    print("\nStep 4: Loading embedding model")
+
+    model = SentenceTransformer(EMBEDDING_MODEL_NAME)
+
+    print("Embedding model loaded.")
+
+    return model
+
+
+# ==========================================
+# 10. GENERATE STABLE VECTOR ID
+# ==========================================
+
+def generate_vector_id(source, text, chunk_number):
+
+    raw = f"{source}:{chunk_number}:{text}"
+
+    return hashlib.sha256(
+        raw.encode("utf-8")
+    ).hexdigest()
+
+
+# ==========================================
+# 11. UPSERT VECTORS
+# ==========================================
+
+def upsert_documents(index, bm25, model, documents):
+
+    print("\nStep 5: Generating embeddings and uploading")
+
+    total = len(documents)
+
+    for start in range(0, total, BATCH_SIZE):
+
+        batch = documents[start:start + BATCH_SIZE]
+
+        texts = [
+            item["text"] for item in batch
+        ]
+
         try:
-            # Dense embeddings locally
-            dense_embeds = embedding_model.encode(texts).tolist()
-            
-            # Sparse embeddings
-            sparse_embeds = bm25.encode_documents(texts)
-            
-            # Prepare vectors
+
+            dense_embeddings = model.encode(
+                texts,
+                show_progress_bar=False
+            ).tolist()
+
+            sparse_embeddings = bm25.encode_documents(texts)
+
             vectors = []
-            for j, (dense, sparse, item) in enumerate(zip(dense_embeds, sparse_embeds, batch)):
-                # Normalize dense vector for hybrid search
-                # Dotproduct is used, meaning scores are a combination of dense and sparse weights
-                vec = {
-                    "id": str(uuid.uuid4()),
+
+            for j, (dense, sparse, item) in enumerate(
+                zip(dense_embeddings, sparse_embeddings, batch)
+            ):
+
+                chunk_number = start + j
+
+                vector_id = generate_vector_id(
+                    item["source"],
+                    item["text"],
+                    chunk_number
+                )
+
+                vectors.append({
+                    "id": vector_id,
                     "values": dense,
                     "sparse_values": sparse,
-                    "metadata": {"text": item["text"], "source": item["source"]}
-                }
-                vectors.append(vec)
-                
+                    "metadata": {
+                        "text": item["text"],
+                        "source": item["source"]
+                    }
+                })
+
             index.upsert(vectors=vectors)
-            print(f"Upserted batch {i//batch_size + 1}/{len(all_chunks)//batch_size + 1}")
+
+            print(
+                f"Uploaded {min(start + BATCH_SIZE, total)}/{total}"
+            )
+
         except Exception as e:
-            print(f"Error processing batch {i//batch_size + 1}: {e}")
-        
-    print("Ingestion complete!")
+
+            print(
+                f"Batch {start // BATCH_SIZE + 1} failed: {e}"
+            )
+
+            raise
+
+    print("\nAll vectors uploaded successfully.")
+
+
+# ==========================================
+# 12. MAIN
+# ==========================================
+
+def main():
+
+    if not PINECONE_API_KEY:
+        raise ValueError("PINECONE_API_KEY is missing.")
+
+    documents = prepare_documents()
+
+    if not documents:
+        raise ValueError("No documents available for ingestion.")
+
+    index = initialize_pinecone()
+
+    bm25 = initialize_bm25(documents)
+
+    model = initialize_embedding_model()
+
+    upsert_documents(
+        index,
+        bm25,
+        model,
+        documents
+    )
+
+    print("\n================================")
+    print("INGESTION COMPLETED SUCCESSFULLY")
+    print("================================")
+
+    print(f"Index: {PINECONE_INDEX_NAME}")
+    print(f"Documents: {len(documents)}")
+    print(f"BM25 file: {BM25_FILE}")
+
 
 if __name__ == "__main__":
     main()
